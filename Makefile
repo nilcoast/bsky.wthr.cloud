@@ -21,7 +21,18 @@ clean:
 	docker rmi ${IMAGE_NAME}:${VERSION} || true
 
 test:
-	go test ./...
+	@echo "Testing weather posts for all cities..."
+	@echo "======================================"
+	@set -a && . ./.env && set +a && go run main.go --city msp --dry-run
+	@echo ""
+	@set -a && . ./.env && set +a && go run main.go --city chicago --dry-run
+	@echo ""
+	@set -a && . ./.env && set +a && go run main.go --city sfo --dry-run
+	@echo ""
+	@set -a && . ./.env && set +a && go run main.go --city nyc --dry-run
+	@echo ""
+	@echo "======================================"
+	@echo "All city tests completed."
 
 coverage:
 	go test ./... -coverprofile=coverage.out

@@ -20,6 +20,7 @@ type WthrResp struct {
 		Properties struct {
 			Periods []struct {
 				DetailedForecast string `json:"detailedForecast"`
+				Name             string `json:"name"`
 			} `json:"periods"`
 		} `json:"properties"`
 	} `json:"current"`
@@ -50,7 +51,200 @@ type CityConfig struct {
 	Identifier string
 	EnvVar     string
 	Model      string
-	Prompt     string
+}
+
+// Base prompt template used for all cities
+const basePromptTemplate = `You are a helpful weather posting bot. You live in %s. You only use weather reporting terms like: wind speed in mph, temperature in fahrenheit. You never make up the weather, because the actual forecast from the National Weather service is included in your context. It's labeled "Current Forecast"
+
+Create a tweet (less than 240 characters) that shows:
+1. Current conditions with emoji at start
+2. Today's weather timeline using emojis (morning→afternoon→evening)
+3. High/low temps
+4. Key weather events
+
+Format example: 🌧️ Now: 45°F rain | Day: 🌥️→⛈️→🌙 | Hi: 52° Lo: 38° | Heavy rain 2-5pm
+
+Do not make up anything.
+Never add hashtags.
+Include date/time from "Current Date".
+Use emojis to show weather progression throughout the day.
+
+Weather emoji guide:
+☀️ = sunny/clear
+⛅ = partly cloudy
+☁️ = cloudy
+🌧️ = rain
+⛈️ = thunderstorm
+🌨️ = snow
+❄️ = heavy snow
+🌫️ = fog
+💨 = windy
+🌙 = clear night
+
+Pack maximum weather info using emojis and concise text.
+
+Current Date: %s
+Current Forecast:
+
+%s`
+
+// HTTP helpers
+func getJSON(url string, v interface{}) error {
+	resp, err := http.Get(url)
+	if err != nil {
+		return fmt.Errorf("GET request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
+		return fmt.Errorf("JSON decode failed: %w", err)
+	}
+	return nil
+}
+
+func postJSON(url string, payload interface{}, response interface{}) error {
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("JSON marshal failed: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(b))
+	if err != nil {
+		return fmt.Errorf("create request failed: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("POST request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if err := json.NewDecoder(resp.Body).Decode(response); err != nil {
+		return fmt.Errorf("JSON decode failed: %w", err)
+	}
+	return nil
+}
+
+// Environment helpers
+func requireEnv(key string) string {
+	value := os.Getenv(key)
+	if value == "" {
+		log.Fatalf("Environment variable %s is required", key)
+	}
+	return value
+}
+
+// Weather service
+func fetchWeather(apiURL string, lat, lon float64) (*WthrResp, error) {
+	url := fmt.Sprintf("%s?latitude=%f&longitude=%f", apiURL, lat, lon)
+	var weather WthrResp
+	if err := getJSON(url, &weather); err != nil {
+		return nil, fmt.Errorf("fetch weather failed: %w", err)
+	}
+	return &weather, nil
+}
+
+// LLM service
+func generatePost(apiURL, model, prompt string) (string, error) {
+	req := &LlamaReq{
+		Model: model,
+		Messages: []Message{
+			{
+				Role:    "user",
+				Content: prompt,
+			},
+		},
+	}
+
+	log.Printf("Sending to LLM: %+v", req)
+
+	var resp LlamaResp
+	if err := postJSON(apiURL, req, &resp); err != nil {
+		return "", fmt.Errorf("LLM request failed: %w", err)
+	}
+
+	if len(resp.Choices) == 0 || resp.Choices[0].Message.Content == "" {
+		return "", fmt.Errorf("empty LLM response")
+	}
+
+	return strings.Trim(resp.Choices[0].Message.Content, "\""), nil
+}
+
+// Bluesky service
+func publishToBluesky(identifier, password, text string) error {
+	var sessionResp server.CreateSessionResponse
+	if err := server.CreateSession(&sessionResp, identifier, password); err != nil {
+		return fmt.Errorf("create session failed: %w", err)
+	}
+
+	post := map[string]any{
+		"$type":     "app.bsky.feed.post",
+		"text":      text,
+		"createdAt": time.Now().Format("2006-01-02T15:04:05.999Z"),
+	}
+
+	if err := repo.CreateRecord(&sessionResp, sessionResp.AccessJWT, identifier, "app.bsky.feed.post", post); err != nil {
+		return fmt.Errorf("create record failed: %w", err)
+	}
+
+	return nil
+}
+
+// Generate a unified prompt for all cities
+func generatePrompt(cityName, date, forecast string) string {
+	return fmt.Sprintf(basePromptTemplate, cityName, date, forecast)
+}
+
+// Process city weather
+func processCityWeather(config CityConfig, weatherAPI, ollamaAPI string, dryRun bool) error {
+	// Fetch weather
+	weather, err := fetchWeather(weatherAPI, config.Latitude, config.Longitude)
+	if err != nil {
+		return fmt.Errorf("weather fetch for %s failed: %w", config.Name, err)
+	}
+
+	// Generate post with enhanced weather data
+	now := time.Now().Format(time.RubyDate)
+
+	// Create a comprehensive weather summary using multiple periods
+	// Include current conditions, progression throughout the day, and key events
+	var forecastDetails string
+	if len(weather.Current.Properties.Periods) > 0 {
+		// Include first few periods to show weather progression
+		for i := 0; i < 4 && i < len(weather.Current.Properties.Periods); i++ {
+			period := weather.Current.Properties.Periods[i]
+			forecastDetails += fmt.Sprintf("Period %d (%s): %s\n",
+				i+1, period.Name, period.DetailedForecast)
+		}
+	}
+
+	prompt := generatePrompt(config.Name, now, forecastDetails)
+
+	post, err := generatePost(ollamaAPI, config.Model, prompt)
+	if err != nil {
+		return fmt.Errorf("post generation for %s failed: %w", config.Name, err)
+	}
+
+	log.Printf("Generated post for %s: %s", config.Name, post)
+
+	if dryRun {
+		fmt.Printf("\n🔵 DRY RUN - Generated post for %s:\n", config.Name)
+		fmt.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+		fmt.Printf("%s\n", post)
+		fmt.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+		fmt.Printf("Character count: %d/240\n", len(post))
+		return nil
+	}
+
+	// Publish to Bluesky
+	password := requireEnv(config.EnvVar)
+	if err := publishToBluesky(config.Identifier, password, post); err != nil {
+		return fmt.Errorf("publish for %s failed: %w", config.Name, err)
+	}
+
+	log.Printf("Successfully posted weather for %s", config.Name)
+	return nil
 }
 
 var cityConfigs = map[string]CityConfig{
@@ -61,34 +255,6 @@ var cityConfigs = map[string]CityConfig{
 		Identifier: "msp.wthr.cloud",
 		EnvVar:     "MSP_WTHR_BSKY_PASS",
 		Model:      "mistral:7b",
-		Prompt: `
-You are a helpful weather posting bot. You live in Minneapolis St Paul. You only use weather reporting terms like: wind speed in mph, temperature in fahrenheit. You never make up the weather, because the actual forecast from the National Weather service is included in your context. It's labeled "Current Forecast"
-
-Reformat the following Minneapolis, St Paul weather report as a tweet less than 240 characters.
-
-Please use only one emoji that best represents the current weather report. It should be at the beginning of the post.
-
-Do not make up anything.
-Do not editorialize.
-Never add any hashtags.
-Please include the current date and time. I've provided it as "Current Date".
-Always include one emoji that best describes the current weather conditions.
-Please use as much techbro language as possible.
-
-If it's snowing or going to snow soon, include an emoji of a snowman.
-if it's raining show a rain cloud emoji, but only if it isn't also snowing
-
-If it's sunny, include an emoji of a bright sun and sunglasses.
-
-Never make up a time. Remove the time if unsure.
-
-Be as creative and descriptive as the 240 characters allow.
-
-Current Date: %s
-Current Forecast:
-
-%s
-`,
 	},
 	"chicago": {
 		Name:       "Chicago",
@@ -97,33 +263,6 @@ Current Forecast:
 		Identifier: "chicago.wthr.cloud",
 		EnvVar:     "CHICAGO_WTHR_BSKY_PASS",
 		Model:      "mistral-nemo",
-		Prompt: `
-You are a helpful weather posting bot. You live in Chicago. You only use weather reporting terms like: wind speed in mph, temperature in fahrenheit. You never make up the weather, because the actual forecast from the National Weather service is included in your context. It's labeled "Current Forecast"
-
-Reformat the following Chicago weather report as a tweet less than 240 characters.
-
-Please use only one emoji that best represents the current weather report. It should be at the beginning of the post.
-
-Do not make up anything.
-Do not editorialize.
-Never add any hashtags.
-Please include the current date and time. I've provided it as "Current Date".
-Always include one emoji that best describes the current weather conditions.
-
-If it's snowing or going to snow soon, include an emoji of a snowman.
-if it's raining show a rain cloud emoji, but only if it isn't also snowing
-
-If it's sunny, include an emoji of a bright sun and sunglasses.
-
-Never make up a time. Remove the time if unsure.
-
-Be as creative and descriptive as the 240 characters allow.
-
-Current Date: %s
-Current Forecast:
-
-%s
-`,
 	},
 	"sfo": {
 		Name:       "San Francisco",
@@ -132,34 +271,6 @@ Current Forecast:
 		Identifier: "sfo.wthr.cloud",
 		EnvVar:     "SFO_WTHR_BSKY_PASS",
 		Model:      "mistral-nemo",
-		Prompt: `
-You are a helpful weather posting bot. You live in San Francisco. You only use weather reporting terms like: wind speed in mph, temperature in fahrenheit. You never make up the weather, because the actual forecast from the National Weather service is included in your context. It's labeled "Current Forecast"
-
-Reformat the following San Francisco weather report as a tweet less than 240 characters.
-
-Please use only one emoji that best represents the current weather report. It should be at the beginning of the post.
-
-Do not make up anything.
-Do not editorialize.
-Never add any hashtags.
-Please include the current date and time. I've provided it as "Current Date".
-Always include one emoji that best describes the current weather conditions.
-Please use as much techbro language as possible.
-
-If it's snowing or going to snow soon, include an emoji of a snowman.
-if it's raining show a rain cloud emoji, but only if it isn't also snowing
-
-If it's sunny, include an emoji of a bright sun and sunglasses.
-
-Never make up a time. Remove the time if unsure.
-
-Be as creative and descriptive as the 240 characters allow.
-
-Current Date: %s
-Current Forecast:
-
-%s
-`,
 	},
 	"nyc": {
 		Name:       "New York City",
@@ -168,39 +279,14 @@ Current Forecast:
 		Identifier: "nyc.wthr.cloud",
 		EnvVar:     "NYC_WTHR_BSKY_PASS",
 		Model:      "mistral-nemo",
-		Prompt: `
-You are a helpful weather posting bot. You live in New York City. You only use weather reporting terms like: wind speed in mph, temperature in fahrenheit. You never make up the weather, because the actual forecast from the National Weather service is included in your context. It's labeled "Current Forecast"
-
-Reformat the following New York City weather report as a tweet less than 240 characters.
-
-Please use only one emoji that best represents the current weather report. It should be at the beginning of the post.
-
-Do not make up anything.
-Do not editorialize.
-Never add any hashtags.
-Please include the current date and time. I've provided it as "Current Date".
-Always include one emoji that best describes the current weather conditions.
-
-If it's snowing or going to snow soon, include an emoji of a snowman.
-if it's raining show a rain cloud emoji, but only if it isn't also snowing
-
-If it's sunny, include an emoji of a bright sun and sunglasses.
-
-Never make up a time. Remove the time if unsure.
-
-Be as creative and descriptive as the 240 characters allow.
-
-Current Date: %s
-Current Forecast:
-
-%s
-`,
 	},
 }
 
 func main() {
 	var city string
+	var dryRun bool
 	flag.StringVar(&city, "city", "", "City to post weather for (msp, chicago, sfo, nyc)")
+	flag.BoolVar(&dryRun, "dry-run", false, "Generate posts without publishing to Bluesky")
 	flag.Parse()
 
 	if city == "" {
@@ -212,92 +298,12 @@ func main() {
 		log.Fatalf("Unknown city: %s. Available cities: msp, chicago, sfo, nyc", city)
 	}
 
-	// Get required API endpoints from environment variables
-	weatherAPI := os.Getenv("WEATHER_API_URL")
-	if weatherAPI == "" {
-		log.Fatal("WEATHER_API_URL environment variable is required")
+	// Get required API endpoints
+	weatherAPI := requireEnv("WEATHER_API_URL")
+	ollamaAPI := requireEnv("OLLAMA_API_URL")
+
+	// Process city weather
+	if err := processCityWeather(config, weatherAPI, ollamaAPI, dryRun); err != nil {
+		log.Fatal(err)
 	}
-
-	ollamaAPI := os.Getenv("OLLAMA_API_URL")
-	if ollamaAPI == "" {
-		log.Fatal("OLLAMA_API_URL environment variable is required")
-	}
-
-	// Get weather data
-	url := fmt.Sprintf("%s?latitude=%f&longitude=%f", weatherAPI, config.Latitude, config.Longitude)
-	resp, err := http.Get(url)
-	if err != nil {
-		log.Panic(err)
-	}
-
-	var wthr WthrResp
-	err = json.NewDecoder(resp.Body).Decode(&wthr)
-	if err != nil {
-		log.Panicf("could not decode weather: %s", err)
-	}
-
-	now := time.Now().Format(time.RubyDate)
-
-	// Prepare LLM request
-	req := &LlamaReq{
-		Model: config.Model,
-		Messages: []Message{
-			{
-				Role:    "user",
-				Content: fmt.Sprintf(config.Prompt, now, wthr.Current.Properties.Periods[0].DetailedForecast),
-			},
-		},
-	}
-
-	log.Printf("sending current forecast for %s %+v", config.Name, req)
-
-	b, _ := json.Marshal(req)
-	llmReq, err := http.NewRequest(
-		"POST",
-		ollamaAPI,
-		bytes.NewBuffer(b),
-	)
-
-	r, err := http.DefaultClient.Do(llmReq)
-	if err != nil {
-		log.Panicf("could not get completion %s %+v", err, r)
-	}
-
-	var llm LlamaResp
-	err = json.NewDecoder(r.Body).Decode(&llm)
-	if err != nil {
-		log.Panicf("could not decode llm response: %s", err)
-	}
-
-	log.Printf("Going to post for %s: %+v", config.Name, llm.Choices[0].Message.Content)
-
-	// Post to Bluesky
-	password := os.Getenv(config.EnvVar)
-	if password == "" {
-		log.Fatalf("Environment variable %s not set", config.EnvVar)
-	}
-
-	var dst server.CreateSessionResponse
-	err = server.CreateSession(&dst, config.Identifier, password)
-	if nil != err {
-		log.Panicf("CREATE SESSION: %s", err)
-	}
-
-	bearerToken := dst.AccessJWT
-
-	when := time.Now().Format("2006-01-02T15:04:05.999Z")
-	text := strings.Trim(llm.Choices[0].Message.Content, "\"")
-
-	post := map[string]any{
-		"$type":     "app.bsky.feed.post",
-		"text":      text,
-		"createdAt": when,
-	}
-
-	err = repo.CreateRecord(&dst, bearerToken, config.Identifier, "app.bsky.feed.post", post)
-	if nil != err {
-		log.Panicf("CREATE RECORD: %s", err)
-	}
-
-	log.Printf("Successfully posted weather for %s", config.Name)
 }
